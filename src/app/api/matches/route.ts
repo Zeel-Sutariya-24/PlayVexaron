@@ -14,6 +14,7 @@ type MatchRow = {
   host_loadout: SpellDef[];
   guest_loadout: SpellDef[];
   state: MatchState;
+  team_size: 1 | 2 | 3;
   input: { intent: Intent; yaw: number; pitch: number; seq: number } | null;
   snapshot: string | null;
   host_seen: Date;
@@ -35,10 +36,12 @@ function ensureTable() {
     snapshot text,
     host_seen timestamptz NOT NULL DEFAULT now(),
     guest_seen timestamptz,
+    team_size integer NOT NULL DEFAULT 1 CHECK (team_size IN (1, 2, 3)),
     updated_at timestamptz NOT NULL DEFAULT now()
   );
   ALTER TABLE arcana_matches ADD COLUMN IF NOT EXISTS host_seen timestamptz NOT NULL DEFAULT now();
   ALTER TABLE arcana_matches ADD COLUMN IF NOT EXISTS guest_seen timestamptz;
+  ALTER TABLE arcana_matches ADD COLUMN IF NOT EXISTS team_size integer NOT NULL DEFAULT 1;
   CREATE INDEX IF NOT EXISTS arcana_matches_updated_at_idx ON arcana_matches (updated_at);
   `).catch((error) => {
     tableReady = null;
@@ -99,6 +102,7 @@ function toMatchInfo(row: MatchRow, peer: string) {
     code: row.code,
     peer,
     state: row.state,
+    teamSize: row.team_size,
     host,
     opponentLoadout: host ? row.guest_loadout : row.host_loadout,
     input: host ? row.input ?? undefined : undefined,
@@ -113,7 +117,7 @@ async function roomFor(code: string, peer: string) {
        guest_seen = CASE WHEN guest_peer = $2 THEN now() ELSE guest_seen END
      WHERE code = $1 AND (host_peer = $2 OR guest_peer = $2)
        AND updated_at > now() - interval '30 minutes'
-     RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
+     RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
     [code, peer],
   );
   return result.rows[0] ?? null;
@@ -141,15 +145,16 @@ export async function POST(req: Request) {
 
     if (body.action === "create") {
       if (!validLoadout(body.loadout)) return failure("Choose exactly five spells first.", 400);
+      const teamSize = body.teamSize === 2 || body.teamSize === 3 ? body.teamSize : 1;
       await pool.query("DELETE FROM arcana_matches WHERE updated_at < now() - interval '30 minutes'");
       for (let attempt = 0; attempt < 4; attempt++) {
         const code = Array.from({ length: 8 }, () => alphabet[randomInt(alphabet.length)]).join("");
         const inserted = await pool.query<MatchRow>(
-          `INSERT INTO arcana_matches (code, host_peer, host_loadout, state, host_seen)
-           VALUES ($1, $2, $3::jsonb, 'waiting', now())
+          `INSERT INTO arcana_matches (code, host_peer, host_loadout, state, host_seen, team_size)
+           VALUES ($1, $2, $3::jsonb, 'waiting', now(), $4)
            ON CONFLICT (code) DO NOTHING
-           RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
-          [code, peer, JSON.stringify(body.loadout)],
+           RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
+          [code, peer, JSON.stringify(body.loadout), teamSize],
         );
         if (inserted.rows[0]) return Response.json(toMatchInfo(inserted.rows[0], peer), { headers: { "cache-control": "no-store" } });
       }
@@ -158,6 +163,7 @@ export async function POST(req: Request) {
 
     if (body.action === "join") {
       if (!validLoadout(body.loadout)) return failure("Choose exactly five spells first.", 400);
+      const teamSize = body.teamSize === 2 || body.teamSize === 3 ? body.teamSize : 1;
       const code = typeof body.code === "string" ? body.code.toUpperCase() : "";
       if (!/^[A-HJ-NP-Z2-9]{8}$/.test(code)) return failure("Enter the 8-character room code.", 400);
       const joined = await pool.query<MatchRow>(
@@ -165,12 +171,14 @@ export async function POST(req: Request) {
          SET guest_peer = $2, guest_loadout = $3::jsonb, state = 'ready', updated_at = now(), guest_seen = now()
          WHERE code = $1 AND state = 'waiting' AND host_peer <> $2
            AND updated_at > now() - interval '30 minutes'
-         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
-        [code, peer, JSON.stringify(body.loadout)],
+         AND team_size = $4
+         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
+        [code, peer, JSON.stringify(body.loadout), teamSize],
       );
       if (joined.rows[0]) return Response.json(toMatchInfo(joined.rows[0], peer), { headers: { "cache-control": "no-store" } });
-      const exists = await pool.query<{ host_peer: string; state: MatchState }>("SELECT host_peer, state FROM arcana_matches WHERE code = $1", [code]);
+      const exists = await pool.query<{ host_peer: string; state: MatchState; team_size: number }>("SELECT host_peer, state, team_size FROM arcana_matches WHERE code = $1", [code]);
       if (!exists.rows[0]) return failure("That room is unavailable. Check the code or create a new duel.", 404);
+      if (exists.rows[0].team_size !== teamSize) return failure("That room uses a different team size.", 409);
       if (exists.rows[0].host_peer === peer) return failure("Open the room in a second browser to join it.", 400);
       return failure("That room already has two players or the duel has started.", 409);
     }
@@ -191,7 +199,7 @@ export async function POST(req: Request) {
       const started = await pool.query<MatchRow>(
         `UPDATE arcana_matches SET state = 'active', updated_at = now()
          WHERE code = $1 AND host_peer = $2 AND state = 'ready'
-         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
+         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
         [code, peer],
       );
       if (!started.rows[0]) return failure("The room changed before the duel could start.", 409);
@@ -205,7 +213,7 @@ export async function POST(req: Request) {
         `UPDATE arcana_matches SET snapshot = $3, updated_at = now(), host_seen = now()
          WHERE code = $1 AND host_peer = $2 AND state = 'active'
            AND guest_seen > now() - interval '8 seconds'
-         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
+         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
         [code, peer, body.snapshot],
       );
       if (!synced.rows[0]) {
@@ -231,7 +239,7 @@ export async function POST(req: Request) {
          WHERE code = $1 AND guest_peer = $2 AND state = 'active'
            AND host_seen > now() - interval '8 seconds'
            AND (input IS NULL OR (input->>'seq')::bigint < $6::bigint)
-         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen`,
+         RETURNING code, host_peer, guest_peer, host_loadout, guest_loadout, state, input, snapshot, host_seen, guest_seen, team_size`,
         [code, peer, JSON.stringify(intent), yaw, Math.max(-1.1, Math.min(1.1, pitch)), seq],
       );
       const current = synced.rows[0] ?? await roomFor(code, peer);

@@ -61,6 +61,7 @@ export interface CastState {
 }
 
 export interface Combatant {
+  actorId: number;
   side: Side;
   name: string;
   pos: V3;
@@ -101,6 +102,7 @@ export interface Combatant {
 export interface Projectile {
   id: number;
   owner: Side;
+  actorId: number;
   def: SpellDef;
   pos: V3;
   vel: V3;
@@ -191,8 +193,9 @@ function emptyStats(): Stats {
   return { damage: 0, damageTaken: 0, hits: 0, casts: 0, counters: 0, dodges: 0, deflects: 0, blocks: 0, env: 0, maxCombo: 0 };
 }
 
-export function makeCombatant(side: Side, name: string, loadout: SpellDef[], x: number, z: number, yaw: number, speed: number): Combatant {
+export function makeCombatant(side: Side, name: string, loadout: SpellDef[], x: number, z: number, yaw: number, speed: number, actorId = side === "player" ? 0 : 100): Combatant {
   return {
+    actorId,
     side,
     name,
     pos: new THREE.Vector3(x, 0, z),
@@ -284,6 +287,9 @@ export interface SimOptions {
   playerName?: string;
   timeLimit?: number;
   enemyDmg?: number;
+  playerTeamLoadouts?: SpellDef[][];
+  enemyTeamLoadouts?: SpellDef[][];
+  teamSize?: 1 | 2 | 3;
 }
 
 export class Sim {
@@ -295,14 +301,13 @@ export class Sim {
   postTime = 0;
   player: Combatant;
   enemy: Combatant;
+  playerTeam: Combatant[];
+  enemyTeam: Combatant[];
   projectiles: Projectile[] = [];
   walls: Wall[] = [];
   zones: Zone[] = [];
   events: SimEvent[] = [];
-  intents: Record<Side, Intent> = {
-    player: { mx: 0, mz: 0, fire: false, dash: false, select: null },
-    enemy: { mx: 0, mz: 0, fire: false, dash: false, select: null },
-  };
+  intents: Record<number, Intent> = {};
   stats: Record<Side, Stats> = { player: emptyStats(), enemy: emptyStats() };
   score = 0;
   scoreMult: number;
@@ -318,33 +323,48 @@ export class Sim {
     this.scoreMult = o.scoreMult;
     this.assist = o.assist;
     this.enemyDmg = o.enemyDmg ?? 1;
-    this.player = makeCombatant("player", o.playerName ?? "You", o.playerLoadout, 0, 11, 0, 7.6);
-    this.enemy = makeCombatant("enemy", o.enemyName, o.enemyLoadout, 0, -11, Math.PI, o.enemySpeed);
+    const teamSize = o.teamSize ?? 1;
+    const teamLoads = (main: SpellDef[], extras: SpellDef[][] | undefined) => [main, ...(extras ?? [])].slice(0, teamSize);
+    const pLoads = teamLoads(o.playerLoadout, o.playerTeamLoadouts);
+    const eLoads = teamLoads(o.enemyLoadout, o.enemyTeamLoadouts);
+    const team = (side: Side, loads: SpellDef[][], baseY: number, yaw: number, speed: number, prefix: string) => loads.map((loadout, i) => {
+      const offset = (i - (loads.length - 1) / 2) * 2.4;
+      const actorId = side === "player" ? i : 100 + i;
+      this.intents[actorId] = { mx: 0, mz: 0, fire: false, dash: false, select: null };
+      return makeCombatant(side, i === 0 ? prefix : `${prefix} ${i + 1}`, loadout, offset, baseY, yaw, speed, actorId);
+    });
+    this.playerTeam = team("player", pLoads, 11, 0, 7.6, o.playerName ?? "You");
+    this.enemyTeam = team("enemy", eLoads, -11, Math.PI, o.enemySpeed, o.enemyName);
+    this.player = this.playerTeam[0];
+    this.enemy = this.enemyTeam[0];
   }
 
   serialize() { return JSON.stringify(this); }
 
   applyNetworkSnapshot(serialized: string, mirrored = false) {
     const data = JSON.parse(serialized) as Record<string, unknown>;
-    const combatant = (raw: unknown) => {
+    const combatant = (raw: unknown, side: Side, actorId: number) => {
       const c = raw as Record<string, unknown>;
       const v = (key: string) => { const n = c[key] as { x: number; y: number; z: number }; return new THREE.Vector3(n.x, n.y, n.z); };
-      return { ...c, pos: v("pos"), vel: v("vel"), kb: v("kb"), dashDir: v("dashDir"), yaw: Number(c.yaw) + (mirrored ? Math.PI : 0), side: mirrored ? (c.side === "player" ? "enemy" : "player") : c.side };
+      const state = { ...c, actorId, pos: v("pos"), vel: v("vel"), kb: v("kb"), dashDir: v("dashDir"), yaw: Number(c.yaw) + (mirrored ? Math.PI : 0), side } as unknown as Combatant;
+      if (mirrored) for (const vec of [state.pos, state.vel, state.kb, state.dashDir]) { vec.x *= -1; vec.z *= -1; }
+      return state;
     };
-    const sourcePlayer = data.player as Record<string, unknown>;
-    const sourceEnemy = data.enemy as Record<string, unknown>;
-    const p = mirrored ? sourceEnemy : sourcePlayer;
-    const e = mirrored ? sourcePlayer : sourceEnemy;
+    const sourcePlayerTeam = (data.playerTeam as Record<string, unknown>[] | undefined) ?? [data.player as Record<string, unknown>];
+    const sourceEnemyTeam = (data.enemyTeam as Record<string, unknown>[] | undefined) ?? [data.enemy as Record<string, unknown>];
+    const localSource = mirrored ? sourceEnemyTeam : sourcePlayerTeam;
+    const rivalSource = mirrored ? sourcePlayerTeam : sourceEnemyTeam;
     const scalarState = { ...data };
-    delete scalarState.player; delete scalarState.enemy;
+    delete scalarState.player; delete scalarState.enemy; delete scalarState.playerTeam; delete scalarState.enemyTeam;
     Object.assign(this, scalarState);
-    Object.assign(this.player, combatant(p));
-    Object.assign(this.enemy, combatant(e));
+    const mapTeam = (source: Record<string, unknown>[], side: Side) => source.map((raw, i) => combatant(raw, side, (side === "player" ? 0 : 100) + i));
+    this.playerTeam = mapTeam(localSource, "player");
+    this.enemyTeam = mapTeam(rivalSource, "enemy");
+    this.player = this.playerTeam[0];
+    this.enemy = this.enemyTeam[0];
+    this.intents = Object.fromEntries([...this.playerTeam, ...this.enemyTeam].map((c) => [c.actorId, { mx: 0, mz: 0, fire: false, dash: false, select: null }]));
     if (mirrored) {
-      for (const c of [this.player, this.enemy]) for (const v of [c.pos, c.vel, c.kb, c.dashDir]) { v.x *= -1; v.z *= -1; }
-    }
-    if (mirrored) {
-      this.projectiles = ((data.projectiles ?? []) as Record<string, unknown>[]).map((p) => ({ ...p, owner: p.owner === "player" ? "enemy" : "player", pos: new THREE.Vector3(-Number((p.pos as Record<string, number>).x), Number((p.pos as Record<string, number>).y), -Number((p.pos as Record<string, number>).z)), vel: new THREE.Vector3(-Number((p.vel as Record<string, number>).x), Number((p.vel as Record<string, number>).y), -Number((p.vel as Record<string, number>).z)) })) as Projectile[];
+      this.projectiles = ((data.projectiles ?? []) as Record<string, unknown>[]).map((p) => ({ ...p, owner: p.owner === "player" ? "enemy" : "player", actorId: p.owner === "player" ? 100 + Number(p.actorId) : Number(p.actorId) - 100, pos: new THREE.Vector3(-Number((p.pos as Record<string, number>).x), Number((p.pos as Record<string, number>).y), -Number((p.pos as Record<string, number>).z)), vel: new THREE.Vector3(-Number((p.vel as Record<string, number>).x), Number((p.vel as Record<string, number>).y), -Number((p.vel as Record<string, number>).z)) })) as Projectile[];
       this.walls = ((data.walls ?? []) as Wall[]).map((w) => ({ ...w, x: -w.x, z: -w.z, yaw: w.yaw + Math.PI, owner: w.owner === "player" ? "enemy" : "player" }));
       this.zones = ((data.zones ?? []) as Zone[]).map((z) => ({ ...z, x: -z.x, z: -z.z, owner: z.owner === "player" ? "enemy" : "player" }));
       this.stats = { player: data.stats && (data.stats as Record<string, Stats>).enemy, enemy: data.stats && (data.stats as Record<string, Stats>).player } as Record<Side, Stats>;
@@ -360,11 +380,17 @@ export class Sim {
     this.events = [];
   }
 
-  foeOf(c: Combatant) {
-    return c.side === "player" ? this.enemy : this.player;
+  foesOf(c: Combatant) {
+    const team = c.side === "player" ? this.enemyTeam : this.playerTeam;
+    return team.filter((actor) => actor.alive);
   }
-  private owner(side: Side) {
-    return side === "player" ? this.player : this.enemy;
+  foeOf(c: Combatant) {
+    const foes = this.foesOf(c);
+    return foes.sort((a, b) => a.pos.distanceToSquared(c.pos) - b.pos.distanceToSquared(c.pos))[0] ?? (c.side === "player" ? this.enemy : this.player);
+  }
+  owner(side: Side, actorId?: number) {
+    const team = side === "player" ? this.playerTeam : this.enemyTeam;
+    return team.find((c) => c.actorId === actorId) ?? team[0];
   }
 
   get comboMult() {
@@ -392,7 +418,7 @@ export class Sim {
   private tick(h: number) {
     if (this.over) {
       this.postTime += h;
-      for (const c of [this.player, this.enemy]) {
+      for (const c of [...this.playerTeam, ...this.enemyTeam]) {
         c.hitFlash = Math.max(0, c.hitFlash - h * 3);
         c.pos.x += c.kb.x * h;
         c.pos.z += c.kb.z * h;
@@ -405,13 +431,11 @@ export class Sim {
     this.time += h;
     this.comboT -= h;
     if (this.comboT <= 0) this.combo = 0;
-    this.updateCombatant(this.player, h);
-    this.updateCombatant(this.enemy, h);
+    for (const c of [...this.playerTeam, ...this.enemyTeam]) this.updateCombatant(c, h);
     this.updateProjectiles(h);
     this.updateWalls(h);
     this.updateZones(h);
-    this.resolveCollisions(this.player);
-    this.resolveCollisions(this.enemy);
+    for (const c of [...this.playerTeam, ...this.enemyTeam]) this.resolveCollisions(c);
     this.checkEnd();
   }
 
@@ -428,7 +452,7 @@ export class Sim {
 
   private updateCombatant(c: Combatant, h: number) {
     if (!c.alive) return;
-    const it = this.intents[c.side];
+    const it = this.intents[c.actorId];
     for (let i = 0; i < c.cd.length; i++) c.cd[i] = Math.max(0, c.cd[i] - h);
     c.gcd = Math.max(0, c.gcd - h);
     c.dashCd = Math.max(0, c.dashCd - h);
@@ -606,8 +630,9 @@ export class Sim {
   private aimDir(c: Combatant, def: SpellDef): V3 {
     const cp = Math.cos(c.pitch);
     const d = new THREE.Vector3(-Math.sin(c.yaw) * cp, Math.sin(c.pitch), -Math.cos(c.yaw) * cp);
-    if (c.side === "player" && this.assist > 0 && def.type !== "wall" && this.enemy.alive) {
-      const foe = this.enemy;
+    const assistFoe = this.foeOf(c);
+    if (c.side === "player" && this.assist > 0 && def.type !== "wall" && assistFoe.alive) {
+      const foe = assistFoe;
       const origin = new THREE.Vector3(c.pos.x, EYE_H, c.pos.z);
       const dist = origin.distanceTo(foe.pos);
       const tLead = def.type === "ball" ? dist / Math.max(8, def.speed) : 0;
@@ -653,6 +678,7 @@ export class Sim {
     this.projectiles.push({
       id: this.nextId++,
       owner: c.side,
+      actorId: c.actorId,
       def,
       pos: origin,
       vel: v,
@@ -698,8 +724,7 @@ export class Sim {
         this.damageWall(w, power * 1.4 * this.wallMult(def, w), c.side, "slash");
       }
     }
-    const foe = this.foeOf(c);
-    if (foe.alive) {
+    for (const foe of this.foesOf(c)) {
       const dx = foe.pos.x - c.pos.x;
       const dz = foe.pos.z - c.pos.z;
       const dist = Math.hypot(dx, dz);
@@ -715,8 +740,10 @@ export class Sim {
       if (Math.hypot(dx, dz) <= range + p.r && inArc(dx, dz, 0.2)) {
         if (power >= p.power * 0.75) {
           p.owner = c.side;
+          p.actorId = c.actorId;
           p.reflected = true;
           p.age = 0;
+          const foe = this.foeOf(c);
           const tgt = foe.alive ? new THREE.Vector3(foe.pos.x, 1.2, foe.pos.z) : p.pos.clone().add(new THREE.Vector3(fx, 0, fz).multiplyScalar(10));
           p.vel = tgt.sub(p.pos).normalize().multiplyScalar(p.vel.length() * 1.2);
           p.power *= 1.15;
@@ -969,8 +996,9 @@ export class Sim {
         }
       }
       if (p.dead) continue;
-      const target = p.owner === "player" ? this.enemy : this.player;
-      if (target.alive && p.pos.y < PLAYER_H + 0.2) {
+      const targetTeam = p.owner === "player" ? this.enemyTeam : this.playerTeam;
+      const target = targetTeam.filter((actor) => actor.alive).sort((a, b) => a.pos.distanceToSquared(p.pos) - b.pos.distanceToSquared(p.pos))[0];
+      if (target && p.pos.y < PLAYER_H + 0.2) {
         const dx = p.pos.x - target.pos.x;
         const dz = p.pos.z - target.pos.z;
         const rr = PLAYER_R + p.r * 0.85;
@@ -981,7 +1009,7 @@ export class Sim {
               this.registerDodge(target);
             }
           } else {
-            this.applyHit(this.owner(p.owner), target, p.power, p.def, p.charge, "proj", p.pos.clone(), p.pos.clone().sub(p.vel.clone().setLength(1)));
+            this.applyHit(this.owner(p.owner, p.actorId), target, p.power, p.def, p.charge, "proj", p.pos.clone(), p.pos.clone().sub(p.vel.clone().setLength(1)));
             this.impact(p, "player", true);
             continue;
           }
@@ -1002,17 +1030,21 @@ export class Sim {
   private impact(p: Projectile, where: string, direct: boolean) {
     p.dead = true;
     this.events.push({ t: "impact", x: p.pos.x, y: p.pos.y, z: p.pos.z, def: p.def, where, r: p.r, owner: p.owner, power: p.power });
-    const target = p.owner === "player" ? this.enemy : this.player;
-    if (!direct && where !== "expire" && target.alive && target.invuln <= 0) {
-      const dx = p.pos.x - target.pos.x;
-      const dz = p.pos.z - target.pos.z;
-      if (Math.hypot(dx, dz) < 1.4 + p.r && p.pos.y < PLAYER_H) {
-        this.applyHit(this.owner(p.owner), target, p.power, p.def, p.charge, "splash", new THREE.Vector3(target.pos.x, 1.3, target.pos.z), p.pos);
+    const targetTeam = p.owner === "player" ? this.enemyTeam : this.playerTeam;
+    const targets = targetTeam.filter((actor) => actor.alive).sort((a, b) => a.pos.distanceToSquared(p.pos) - b.pos.distanceToSquared(p.pos));
+    if (!direct && where !== "expire" && p.pos.y < PLAYER_H) {
+      for (const target of targets) {
+        const dx = p.pos.x - target.pos.x;
+        const dz = p.pos.z - target.pos.z;
+        if (target.invuln <= 0 && Math.hypot(dx, dz) < 1.4 + p.r) {
+          this.applyHit(this.owner(p.owner, p.actorId), target, p.power, p.def, p.charge, "splash", new THREE.Vector3(target.pos.x, 1.3, target.pos.z), p.pos);
+        }
       }
     }
     if (where !== "expire") {
-      const ex = where === "player" ? target.pos.x : p.pos.x;
-      const ez = where === "player" ? target.pos.z : p.pos.z;
+      const target = targets[0];
+      const ex = where === "player" && target ? target.pos.x : p.pos.x;
+      const ez = where === "player" && target ? target.pos.z : p.pos.z;
       this.envImpact(p.def, new THREE.Vector3(ex, 0.3, ez), 0.8 + 0.6 * p.charge, p.owner);
     }
   }
@@ -1065,8 +1097,9 @@ export class Sim {
       if (w.auraT <= 0) {
         w.auraT = 0.3;
         const heat = w.def.temp / 100;
-        const foe = w.owner === "player" ? this.enemy : this.player;
-        if (foe.alive && (heat >= 0.4 || heat <= -0.4) && wallDistance(w, foe.pos.x, foe.pos.z) < 1.9) {
+        const foeTeam = w.owner === "player" ? this.enemyTeam : this.playerTeam;
+        const foe = foeTeam.filter((actor) => actor.alive).sort((a, b) => wallDistance(w, a.pos.x, a.pos.z) - wallDistance(w, b.pos.x, b.pos.z))[0];
+        if (foe && (heat >= 0.4 || heat <= -0.4) && wallDistance(w, foe.pos.x, foe.pos.z) < 1.9) {
           if (heat >= 0.4) this.applyStatus(foe, "burn", 1.2, 2.5 + 3 * heat, w.owner);
           else this.applyStatus(foe, "chill", 1.4, 0.2 + 0.2 * Math.abs(heat), w.owner);
         }
@@ -1160,7 +1193,7 @@ export class Sim {
       }
       if (z.tickT <= 0) {
         z.tickT = 0.25;
-        for (const c of [this.player, this.enemy]) {
+        for (const c of [...this.playerTeam, ...this.enemyTeam]) {
           if (!c.alive) continue;
           if (Math.hypot(c.pos.x - z.x, c.pos.z - z.z) < z.r) this.zoneEffect(z, c);
         }
@@ -1243,8 +1276,7 @@ export class Sim {
         c.kb.multiplyScalar(0.7);
       }
     }
-    const foe = this.foeOf(c);
-    if (foe.alive) {
+    for (const foe of [...this.playerTeam, ...this.enemyTeam].filter((actor) => actor.side !== c.side && actor.alive)) {
       const dx = c.pos.x - foe.pos.x;
       const dz = c.pos.z - foe.pos.z;
       const d = Math.hypot(dx, dz);
@@ -1265,13 +1297,13 @@ export class Sim {
 
   // ---- end of match -----------------------------------------------------------
   private checkEnd() {
-    const p = this.player;
-    const e = this.enemy;
-    if (p.hp <= 0 || e.hp <= 0) {
-      this.end(p.hp <= 0 && e.hp <= 0 ? "draw" : e.hp <= 0 ? "win" : "lose");
+    const playerAlive = this.playerTeam.some((c) => c.alive && c.hp > 0);
+    const enemyAlive = this.enemyTeam.some((c) => c.alive && c.hp > 0);
+    if (!playerAlive || !enemyAlive) {
+      this.end(!playerAlive && !enemyAlive ? "draw" : !enemyAlive ? "win" : "lose");
     } else if (this.time >= this.timeLimit) {
       this.timedOut = true;
-      const diff = p.hp - e.hp;
+      const diff = this.playerTeam.reduce((sum, c) => sum + Math.max(0, c.hp), 0) - this.enemyTeam.reduce((sum, c) => sum + Math.max(0, c.hp), 0);
       this.end(Math.abs(diff) < 0.5 ? "draw" : diff > 0 ? "win" : "lose");
     }
   }
@@ -1279,15 +1311,15 @@ export class Sim {
   private end(result: Result) {
     this.over = true;
     this.result = result;
-    if (this.player.hp <= 0) this.player.alive = false;
-    if (this.enemy.hp <= 0) this.enemy.alive = false;
-    for (const c of [this.player, this.enemy]) {
+    for (const c of [...this.playerTeam, ...this.enemyTeam]) if (c.hp <= 0) c.alive = false;
+    for (const c of [...this.playerTeam, ...this.enemyTeam]) {
       if (c.cast) this.interrupt(c);
       c.fireHeld = false;
     }
     if (result === "win") {
       const left = Math.max(0, this.timeLimit - this.time);
-      const bonus = Math.round((1000 + this.player.hp * 10 + left * 6) * this.scoreMult);
+      const survivingHp = this.playerTeam.reduce((sum, c) => sum + Math.max(0, c.hp), 0);
+      const bonus = Math.round((1000 + survivingHp * 10 + left * 6) * this.scoreMult);
       this.bonus = bonus;
       this.score += bonus;
       this.events.push({ t: "score", pts: bonus, label: "VICTORY BONUS" });

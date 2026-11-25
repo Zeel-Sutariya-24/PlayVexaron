@@ -69,6 +69,7 @@ export default function BattleHUD({ hud, touch, online = false, onlineHost = fal
         <div className="enemy-box">
           <div className="en-name">
             {hud.enemyName}
+            {hud.teamSize > 1 && <span className="squad-count">SQUAD {hud.enemiesAlive}/{hud.teamSize}</span>}
             {hud.eAttune.length > 0 && (
               <span className="aura" title="Enemy attunement: hit with a counter-element for +20% damage">
                 aura {hud.eAttune.map((e, i) => <ElementIcon key={i} el={e} size={14} />)}
@@ -115,6 +116,7 @@ export default function BattleHUD({ hud, touch, online = false, onlineHost = fal
           <i style={{ width: `${hpPct}%` }} />
           <span>♥ {Math.ceil(hpPct)}</span>
         </div>
+        {hud.teamSize > 1 && <div className="squad-count ally-count">ALLIES {hud.alliesAlive}/{hud.teamSize}</div>}
         <div key={"mf" + hud.manaFlash} className={`bar mana ${hud.manaFlash > 0 ? "flash" : ""}`}>
           <i style={{ width: `${Math.max(0, hud.mana)}%` }} />
           <span>✦ {Math.floor(hud.mana)}</span>

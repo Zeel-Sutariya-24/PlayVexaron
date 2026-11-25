@@ -61,10 +61,11 @@ export class AIController {
   }
 
   private choose(d: number): number {
-    const { me, foe, sim } = this;
+    const { me, sim } = this;
+    const foe = sim.foeOf(me);
     let best = -1;
     let bestScore = 0.55;
-    const myWalls = sim.walls.filter((w) => w.owner === "enemy" && !w.dead).length;
+    const myWalls = sim.walls.filter((w) => w.owner === me.side && !w.dead).length;
     for (let i = 0; i < me.loadout.length; i++) {
       const def = me.loadout[i];
       if (me.cd[i] > 0 || me.mana < def.manaCost + (def.type === "slash" ? 0 : 5)) continue;
@@ -101,8 +102,9 @@ export class AIController {
   }
 
   update(dt: number) {
-    const it = this.sim.intents.enemy;
-    const { me, foe, sim, p } = this;
+    const it = this.sim.intents[this.me.actorId];
+    const { me, sim, p } = this;
+    const foe = sim.foeOf(me);
     it.mx = 0;
     it.mz = 0;
     it.dash = false;
@@ -120,7 +122,7 @@ export class AIController {
     // threat assessment (incoming enemy projectiles)
     this.threat = 0;
     for (const pr of sim.projectiles) {
-      if (pr.dead || pr.owner !== "player") continue;
+      if (pr.dead || pr.owner === me.side) continue;
       const rx = pr.pos.x - me.pos.x;
       const rz = pr.pos.z - me.pos.z;
       if (rx * pr.vel.x + rz * pr.vel.z < 0) this.threat += pr.power;
@@ -236,7 +238,7 @@ export class AIController {
     }
     if (me.dashCd <= 0 && me.mana >= DASH_COST && !stunned) {
       for (const pr of sim.projectiles) {
-        if (pr.dead || pr.owner !== "player") continue;
+        if (pr.dead || pr.owner === me.side) continue;
         let rec = this.seen.get(pr.id);
         if (!rec) {
           rec = { t: sim.time, roll: Math.random() < p.dodge, done: false };

@@ -62,6 +62,9 @@ export interface HudSnap {
   lastHurt: number;
   manaFlash: number;
   walls: number;
+  teamSize: 1 | 2 | 3;
+  alliesAlive: number;
+  enemiesAlive: number;
 }
 
 export interface EndInfo {
@@ -86,6 +89,7 @@ export interface BattleOptions {
   sensitivity: number;
   onEnd: (e: EndInfo) => void;
   online?: { host: boolean; opponentLoadout: SpellDef[]; opponentName: string };
+  teamSize?: 1 | 2 | 3;
 }
 
 const STATUS_TEXT: Record<StatusId, string> = { burn: "BURNING!", chill: "CHILLED", freeze: "FROZEN!", wet: "SOAKED", stun: "STUNNED!", blind: "BLINDED", mud: "BOGGED" };
@@ -172,11 +176,12 @@ export class BattleSession implements SceneModule {
   readonly input: InputManager;
   phase: Phase = "countdown";
   private prevPhase: Phase = "countdown";
-  private ai: AIController | null;
+  private ai: AIController[];
   private particles: ParticleSystem;
   private rings = new RingPool();
   private arena: Arena;
   private mage: MageModel;
+  private squadMages: MageModel[] = [];
   private rig: BookRig;
   private projVis = new Map<number, ProjVis>();
   private wallVis = new Map<number, WallVis>();
@@ -218,16 +223,23 @@ export class BattleSession implements SceneModule {
     const diff = DIFFICULTY[o.difficulty];
     this.low = engine.isMobile;
     const enemyLoadout = o.online?.opponentLoadout ?? aiLoadout(o.difficulty);
+    const teamSize = o.teamSize ?? 1;
+    const fillTeam = (main: SpellDef[]) => Array.from({ length: Math.max(0, teamSize - 1) }, () => aiLoadout(o.difficulty));
     this.sim = new Sim({
       playerLoadout: o.loadout,
       enemyLoadout,
+      playerTeamLoadouts: fillTeam(o.loadout),
+      enemyTeamLoadouts: fillTeam(enemyLoadout),
+      teamSize,
       enemySpeed: o.online ? 7.6 : diff.speed,
       scoreMult: o.online ? 1 : diff.scoreMult,
       enemyDmg: o.online ? 1 : diff.damage,
       assist: o.online ? 0 : Math.max(diff.assist, o.touch ? 0.9 : 0),
       enemyName: o.online?.opponentName ?? diff.enemyName,
     });
-    this.ai = o.online ? null : new AIController(this.sim, this.sim.enemy, this.sim.player, diff);
+    this.ai = [...this.sim.enemyTeam, ...this.sim.playerTeam.slice(1)]
+      .filter((actor) => !o.online || actor !== this.sim.enemy)
+      .map((actor) => new AIController(this.sim, actor, this.sim.foeOf(actor), diff));
     this.input = new InputManager(o.inputEl);
     this.input.sensitivity = o.sensitivity;
     this.input.onPointerLockLost = () => {
@@ -241,6 +253,12 @@ export class BattleSession implements SceneModule {
 
     this.mage = new MageModel(0xffd27a);
     this.scene.add(this.mage.group);
+    this.squadMages = [...this.sim.enemyTeam.slice(1), ...this.sim.playerTeam.slice(1)].map((actor, i) => {
+      const mage = new MageModel(actor.side === "enemy" ? 0xff8b5c : 0x9c7bff);
+      mage.group.userData.actorId = actor.actorId;
+      this.scene.add(mage.group);
+      return mage;
+    });
     this.rig = new BookRig();
     this.camera.rotation.order = "YXZ";
     this.camera.add(this.rig.group);
@@ -349,14 +367,17 @@ export class BattleSession implements SceneModule {
       lastHurt: this.lastHurt,
       manaFlash: this.manaFlash,
       walls: s.walls.filter((w) => w.owner === "player").length,
+      teamSize: s.playerTeam.length as 1 | 2 | 3,
+      alliesAlive: s.playerTeam.filter((actor) => actor.alive && actor.hp > 0).length,
+      enemiesAlive: s.enemyTeam.filter((actor) => actor.alive && actor.hp > 0).length,
     };
   }
 
-  networkInput() { return { intent: { ...this.sim.intents.player }, yaw: this.sim.player.yaw, pitch: this.sim.player.pitch }; }
+  networkInput() { return { intent: { ...this.sim.intents[this.sim.player.actorId] }, yaw: this.sim.player.yaw, pitch: this.sim.player.pitch }; }
 
   setRemoteInput(input: { intent: Intent; yaw: number; pitch: number }) {
     if (!this.o.online?.host) return;
-    Object.assign(this.sim.intents.enemy, input.intent);
+    Object.assign(this.sim.intents[this.sim.enemy.actorId], input.intent);
     this.sim.enemy.yaw = input.yaw + Math.PI;
     this.sim.enemy.pitch = input.pitch;
   }
@@ -403,7 +424,7 @@ export class BattleSession implements SceneModule {
         this.pause();
         return;
       }
-      const it = sim.intents.player;
+      const it = sim.intents[sim.player.actorId];
       if (this.phase === "playing") {
         const mv = input.getMove();
         it.mx = mv.mx;
@@ -438,7 +459,7 @@ export class BattleSession implements SceneModule {
       }
     }
     if (this.phase === "playing" && (!this.o.online || this.o.online.host)) {
-      this.ai?.update(sdt);
+      for (const controller of this.ai) controller.update(sdt);
       sim.step(sdt);
     } else if (this.phase === "over" && (!this.o.online || this.o.online.host)) {
       sim.step(sdt);
@@ -1254,6 +1275,28 @@ export class BattleSession implements SceneModule {
     });
     this.statusFx(en, dt);
     this.statusFx(pl, dt * 0.5);
+    for (let i = 0; i < this.squadMages.length; i++) {
+      const mage = this.squadMages[i];
+      const actorId = Number(mage.group.userData.actorId);
+      const actor = [...sim.enemyTeam, ...sim.playerTeam].find((entry) => entry.actorId === actorId);
+      if (!actor) continue;
+      mage.group.position.set(actor.pos.x, 0, actor.pos.z);
+      mage.group.rotation.y = actor.yaw;
+      const actorDef = actor.cast ? actor.loadout[actor.cast.slot] : null;
+      mage.update(dt, {
+        speed01: Math.min(1, Math.hypot(actor.vel.x, actor.vel.z) / 7),
+        charging: !!actor.cast,
+        charge01: actor.cast ? Math.min(1, actor.cast.charge / 3) : 0,
+        flash: actor.hitFlash,
+        dead: !actor.alive,
+        auraColor: actorDef?.colors[0] ?? (actor.side === "enemy" ? 0xff8b5c : 0x9c7bff),
+        auraOn: actor.attuneT > 0 && actor.attune.length ? 1 : 0,
+        stunned: !!actor.status.stun || !!actor.status.freeze,
+        t,
+        strafe: (actor.vel.x * rgt(actor.yaw).x + actor.vel.z * rgt(actor.yaw).z) / 7,
+      });
+      this.statusFx(actor, dt * 0.5);
+    }
     // enemy charge particles
     if (en.cast && Math.random() < 0.8 && edef) {
       this.mage.orbObject.getWorldPosition(this.tmpV);
@@ -1315,6 +1358,7 @@ export class BattleSession implements SceneModule {
     for (const p of this.popups) p.el.remove();
     this.popups = [];
     this.mage.dispose();
+    for (const mage of this.squadMages) mage.dispose();
     disposeTree(this.rig.group);
     this.particles.dispose();
     this.rings.dispose();

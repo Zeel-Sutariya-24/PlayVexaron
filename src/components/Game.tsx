@@ -58,7 +58,7 @@ export default function Game() {
   const engineRef = useRef<Engine | null>(null);
   const labRef = useRef<LabScene | null>(null);
   const sessionRef = useRef<BattleSession | null>(null);
-  const lastRun = useRef<{ ids: string[]; diff: Difficulty; online?: { host: boolean; opponentLoadout: SpellDef[]; opponentName: string } } | null>(null);
+  const lastRun = useRef<{ ids: string[]; diff: Difficulty; teamSize: 1 | 2 | 3; online?: { host: boolean; opponentLoadout: SpellDef[]; opponentName: string } } | null>(null);
   const peerId = useRef("");
   const matchSeq = useRef(0);
   const startedOnline = useRef(false);
@@ -79,6 +79,8 @@ export default function Game() {
   const [loaded, setLoaded] = useState(false);
   const [glError, setGlError] = useState(false);
   const [pvpDialog, setPvpDialog] = useState(false);
+  const [teamDialog, setTeamDialog] = useState(false);
+  const [teamSize, setTeamSize] = useState<1 | 2 | 3>(1);
   const [onlineRole, setOnlineRole] = useState<"host" | "guest" | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [matchRoom, setMatchRoom] = useState<MatchInfo | null>(null);
@@ -212,7 +214,7 @@ export default function Game() {
   }, []);
 
   const startBattle = useCallback(
-    (ids: string[], diff: Difficulty, online?: { host: boolean; opponentLoadout: SpellDef[]; opponentName: string }) => {
+    (ids: string[], diff: Difficulty, online?: { host: boolean; opponentLoadout: SpellDef[]; opponentName: string }, squadSize: 1 | 2 | 3 = teamSize) => {
       const engine = engineRef.current;
       const canvas = canvasRef.current;
       const layer = dmgRef.current;
@@ -222,7 +224,7 @@ export default function Game() {
       sessionRef.current?.dispose();
       sfx.resume();
       sfx.battleMusic();
-      lastRun.current = { ids, diff, online };
+      lastRun.current = { ids, diff, online, teamSize: squadSize };
       const session = new BattleSession(engine, {
         loadout: defs,
         difficulty: diff,
@@ -232,6 +234,7 @@ export default function Game() {
         sensitivity: live.current.settings.sensitivity,
         onEnd: handleEnd,
         online,
+        teamSize: squadSize,
       });
       sessionRef.current = session;
       if (!live.current.touch) session.input.requestLock(); // called inside a click/key gesture
@@ -242,12 +245,12 @@ export default function Game() {
       setHud(session.snapshot());
       setScreen("battle");
     },
-    [handleEnd],
+    [handleEnd, teamSize],
   );
 
   const restart = useCallback(() => {
     const r = lastRun.current;
-    if (r) startBattle(r.ids, r.diff, r.online);
+    if (r) startBattle(r.ids, r.diff, r.online, r.teamSize);
   }, [startBattle]);
 
   const goScreen = useCallback(
@@ -297,12 +300,12 @@ export default function Game() {
         const peer = peerId.current || (peerId.current = newPeerId());
         const selectedSpells = loadoutIds.map((id) => live.current.spells.find((spell) => spell.id === id)).filter(Boolean) as SpellDef[];
         if (selectedSpells.length !== 5) throw new Error("Choose five available spells before starting the duel.");
-        const room = onlineRole === "host" ? await createMatch(peer, selectedSpells) : await joinMatch(peer, joinCode, selectedSpells);
+        const room = onlineRole === "host" ? await createMatch(peer, selectedSpells, teamSize) : await joinMatch(peer, joinCode, selectedSpells, teamSize);
         setMatchRoom(room); startedOnline.current = false;
       } catch (e) { setMatchError(e instanceof Error ? e.message : "Could not create the duel."); }
     };
     void run();
-  }, [joinCode, loadoutIds, onlineRole, startBattle]);
+  }, [joinCode, loadoutIds, onlineRole, startBattle, teamSize]);
 
   const openPvp = useCallback(() => {
     if (live.current.spells.length < 10) {
@@ -311,6 +314,15 @@ export default function Game() {
       return;
     }
     setPvpDialog(true); setMatchError("");
+  }, [goScreen, notify]);
+
+  const openTeamModes = useCallback(() => {
+    if (live.current.spells.length < 10) {
+      notify(`Forge ${10 - live.current.spells.length} more spells to unlock team battles.`, "bad");
+      goScreen("lab");
+      return;
+    }
+    setTeamDialog(true);
   }, [goScreen, notify]);
 
   const toggleMute = useCallback(() => {
@@ -416,7 +428,7 @@ export default function Game() {
           const localIds = loadLoadout().filter((id) => live.current.spells.some((s) => s.id === id)).slice(0, 5);
           startBattle(localIds.length === 5 ? localIds : autoPick(live.current.spells), live.current.settings.difficulty, {
             host: status.host, opponentLoadout, opponentName: "Rival",
-          });
+          }, status.teamSize ?? 1);
         }
       } catch (e) { setMatchError(e instanceof Error ? e.message : "Connection to the duel room was lost."); }
       finally { busy = false; }
@@ -552,9 +564,11 @@ export default function Game() {
           onDuel={() => {
             sfx.resume();
             sfx.ui();
+            setTeamSize(1);
             openLoadout();
           }}
           onPvp={openPvp}
+          onTeamBattle={openTeamModes}
           onMute={toggleMute}
           onMusicVolume={changeMusicVolume}
           onClearScores={() => {
@@ -646,9 +660,12 @@ export default function Game() {
       {pvpDialog && screen === "menu" && (
         <div className="overlay">
           <div className="modal panel pvp-modal">
-            <h2>Duel a Player</h2>
-            <p className="hint">Choose five spells in your loadout. Share the room code with your rival.</p>
+            <h2>Online Match</h2>
+            <p className="hint">Choose a team size, then invite a rival with your room code. In squad modes, each human commands an AI-filled team.</p>
             <div className="modal-btns">
+              <div className="team-size-row">
+                {([1, 2, 3] as const).map((size) => <button key={size} className={`btn sm ${teamSize === size ? "gold" : "ghost"}`} onClick={() => setTeamSize(size)}>{size}v{size}</button>)}
+              </div>
               <button className="btn gold big" onClick={() => { setOnlineRole("host"); setPvpDialog(false); setMatchRoom(null); goScreen("loadout"); }}>Create a room</button>
               <label className="room-entry">Room code<input value={joinCode} maxLength={8} autoCapitalize="characters" autoComplete="off" spellCheck={false} onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g, ""))} placeholder="8-CHARACTER CODE" /></label>
               <button className="btn big" disabled={joinCode.length !== 8} onClick={() => { setOnlineRole("guest"); setPvpDialog(false); setMatchRoom(null); goScreen("loadout"); }}>Join room</button>
@@ -659,11 +676,25 @@ export default function Game() {
         </div>
       )}
 
+      {teamDialog && screen === "menu" && (
+        <div className="overlay">
+          <div className="modal panel pvp-modal">
+            <h2>Squad Battle</h2>
+            <p className="hint">Fight a full AI squad. You control one mage; your teammates are AI allies.</p>
+            <div className="modal-btns">
+              <button className="btn gold big" onClick={() => { setOnlineRole(null); setTeamSize(2); setTeamDialog(false); openLoadout(); }}>Enter 2v2</button>
+              <button className="btn big" onClick={() => { setOnlineRole(null); setTeamSize(3); setTeamDialog(false); openLoadout(); }}>Enter 3v3</button>
+              <button className="btn ghost" onClick={() => setTeamDialog(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {matchRoom && screen === "loadout" && (
         <div className="overlay">
           <div className="modal panel pvp-modal">
             <h2>{matchRoom.host ? "Duel room" : "Joining duel"}</h2>
-            <p className="hint">Share this room code with your rival:</p>
+            <p className="hint">{matchRoom.teamSize === 1 ? "Share this room code with your rival:" : `Share this ${matchRoom.teamSize}v${matchRoom.teamSize} squad room code with your rival. AI allies fill each team.`}</p>
             <div className="room-code">{matchRoom.code}</div>
             <button className="btn sm" onClick={() => void navigator.clipboard.writeText(matchRoom.code).then(() => notify("Room code copied.", "good")).catch(() => notify("Select the room code above and copy it.", "bad"))}>Copy room code</button>
             <p className="hint">{matchRoom.state === "waiting" ? "Waiting for a player to join…" : matchRoom.state === "ready" ? "Rival joined. Starting duel…" : "Connecting to the arena…"}</p>

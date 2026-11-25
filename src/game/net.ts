@@ -6,6 +6,7 @@ export interface MatchInfo {
   code: string;
   peer: string;
   state: MatchState;
+  teamSize?: 1 | 2 | 3;
   host: boolean;
   opponentLoadout?: SpellDef[];
   opponentName?: string;
@@ -22,8 +23,8 @@ async function request<T>(body: Record<string, unknown>): Promise<T> {
   return data as T;
 }
 
-export const createMatch = (peer: string, loadout: SpellDef[]) => request<MatchInfo>({ action: "create", peer, loadout });
-export const joinMatch = (peer: string, code: string, loadout: SpellDef[]) => request<MatchInfo>({ action: "join", peer, code, loadout });
+export const createMatch = (peer: string, loadout: SpellDef[], teamSize: 1 | 2 | 3 = 1) => request<MatchInfo>({ action: "create", peer, loadout, teamSize });
+export const joinMatch = (peer: string, code: string, loadout: SpellDef[], teamSize: 1 | 2 | 3 = 1) => request<MatchInfo>({ action: "join", peer, code, loadout, teamSize });
 export const pollMatch = (peer: string, code: string) => request<MatchInfo>({ action: "poll", peer, code });
 export const startMatch = (peer: string, code: string) => request<MatchInfo>({ action: "start", peer, code });
 export const syncAsHost = (peer: string, code: string, snapshot: string) =>

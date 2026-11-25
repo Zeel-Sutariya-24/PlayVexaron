@@ -13,12 +13,13 @@ interface Props {
   onBook: () => void;
   onDuel: () => void;
   onPvp: () => void;
+  onTeamBattle: () => void;
   onMute: () => void;
   onMusicVolume: (volume: number) => void;
   onClearScores: () => void;
 }
 
-export default function Menu({ spellCount, scores, muted, musicVolume, touch, onLab, onBook, onDuel, onPvp, onMute, onMusicVolume, onClearScores }: Props) {
+export default function Menu({ spellCount, scores, muted, musicVolume, touch, onLab, onBook, onDuel, onPvp, onTeamBattle, onMute, onMusicVolume, onClearScores }: Props) {
   const unlocked = spellCount >= 10;
   const remain = Math.max(0, 10 - spellCount);
   return (
@@ -44,6 +45,7 @@ export default function Menu({ spellCount, scores, muted, musicVolume, touch, on
           <button className={`btn big ${unlocked ? "duel" : "locked"}`} onClick={onDuel}>
             {unlocked ? "⚔ Duel the AI" : `⚿ Duel the AI — forge ${remain} more`}
           </button>
+          <button className="btn big" onClick={onTeamBattle}>✧ Squad Battles · 2v2 / 3v3</button>
           <button className="btn big ghost" onClick={onPvp}>
             ⚔ Duel a Player <em>online</em>
           </button>
